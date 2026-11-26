@@ -1,0 +1,12 @@
+{
+  "seq_len": 20,
+  "n_features": 63,
+  "clases": {
+    "0": "neutro",
+    "1": "siguiente",
+    "2": "anterior"
+  },
+  "normalizar_escala": true,
+  "espejo": true,
+  "mano": "Any"
+}

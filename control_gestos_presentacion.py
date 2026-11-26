@@ -3,46 +3,59 @@
 """
 ==========================================================================
  CONTROL DE PRESENTACIONES POR GESTOS (PowerPoint / Google Slides / Canva)
- Version 3.1
+ Version 5 - gestos dinamicos + deteccion de dedos mas robusta
 ==========================================================================
 
-INSTALACION (una sola vez, con el venv activo):
+INSTALACION (con el venv activo):
 
-    python -m pip install opencv-python mediapipe pyautogui numpy
+    python -m pip install opencv-python mediapipe pyautogui numpy torch
 
-MODELO:
-    Necesita `hand_landmarker.task` junto a este script. Si no existe, el
-    programa intenta descargarlo automaticamente.
+ARCHIVOS NECESARIOS EN LA MISMA CARPETA:
+    features_gestos.py             (preprocesamiento compartido)
+    hand_landmarker.task           (se descarga solo si falta)
+    modelo/modelo_gestos.pt        (lo genera entrenar_modelo.py)
+    modelo/modelo_meta.json        (lo genera entrenar_modelo.py)
 
-GESTOS:
-- Sin mano / puno cerrado ............ REPOSO (no hace nada)
-- MANO DERECHA abierta (5 dedos) ..... SIGUIENTE -> tecla `right`
-- MANO IZQUIERDA abierta (5 dedos) ... ANTERIOR  -> tecla `left`
-- Solo indice levantado (cualquier mano) PUNTERO -> mueve el cursor
+MODOS DE NAVEGACION (se elige solo al arrancar):
+  * DINAMICO (si existe el modelo y torch esta instalado):
+        deslizar la mano DERECHA de derecha a izquierda -> SIGUIENTE (right)
+        deslizar la mano DERECHA de izquierda a derecha -> ANTERIOR  (left)
+        (la mano y las direcciones dependen de como grabaste el dataset)
+  * ESTATICO (respaldo si no hay modelo):
+        mano DERECHA abierta -> SIGUIENTE | mano IZQUIERDA abierta -> ANTERIOR
 
-    Si las dos manos estan abiertas a la vez, o una abierta y otra con
-    indice, se considera "SIN GESTO" para evitar acciones accidentales.
+EN AMBOS MODOS:
+    Solo indice levantado -> PUNTERO (mueve el cursor, sin cooldown)
+    Puno cerrado / sin mano -> REPOSO
 
-TECLAS DE LA VENTANA:
-    Q / ESC / X ... salir
+    En modo dinamico el reconocimiento de deslizamientos se pausa mientras
+    apuntas con el indice, para que mover el puntero no dispare diapositivas.
 
-USO:
-    Haz clic en tu presentacion para que tenga el foco (PyAutoGUI envia las
-    teclas a la ventana activa) y despues muestra los gestos a la camara.
-    En pantalla aparece "IZQ" / "DER" sobre cada mano: asi verificas que
-    MediaPipe distingue bien cual es cual. Si las ves al reves, pon
-    SWAP_HANDEDNESS = True.
+DIAGNOSTICO EN PANTALLA:
+    Bajo cada mano se muestra, p. ej., "POINT 1000": el tipo detectado y los dedos
+    extendidos (indice, medio, anular, menique; 1 = extendido). Si un gesto no se
+    reconoce, ahi se ve por que. El pulgar NO se usa para clasificar.
+    "IZQ"/"DER" es la lateralidad (depende de SWAP_HANDEDNESS).
 
-NOTA: cv2.putText no soporta acentos ni la n con tilde, por eso el HUD
-      esta escrito en ASCII.
+AJUSTES RAPIDOS (arriba, en "Parametros ajustables"):
+    MODO_NAV         "auto" | "estatico" | "dinamico"
+    FINGER_EXT_RATIO subelo si detecta dedos extendidos que estan doblados;
+                     bajalo si no reconoce dedos que si estan extendidos
+    DETECT_CONF      confianza de MediaPipe (0.5 por defecto)
+
+SALIR: Q, ESC o cerrar la ventana (X).
+NOTA: cv2.putText no soporta acentos ni la n con tilde (HUD en ASCII).
 ==========================================================================
 """
 
+import json
 import math
 import os
 import sys
 import time
 import urllib.request
+from collections import deque
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
@@ -51,130 +64,196 @@ import pyautogui
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-# --------------------------------------------------------------------------
-# PyAutoGUI sin retrasos
-# --------------------------------------------------------------------------
+from features_gestos import construir_features, normalizar_mano
+
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
 # --------------------------------------------------------------------------
 # Parametros ajustables
 # --------------------------------------------------------------------------
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "hand_landmarker.task"
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/1/hand_landmarker.task")
+MODELO_GESTOS = BASE_DIR / "modelo" / "modelo_gestos.pt"
+MODELO_META = BASE_DIR / "modelo" / "modelo_meta.json"
 
 CAM_INDEX = 0
 CAM_WIDTH, CAM_HEIGHT, CAM_FPS = 960, 540, 30
 WINDOW_NAME = "Control de diapositivas por gestos"
 
-# Si ves "IZQ" sobre tu mano derecha (y viceversa), cambia esto a True
-SWAP_HANDEDNESS = True
+SWAP_HANDEDNESS = True   # True si ves "IZQ" sobre tu mano derecha (mismo valor que al grabar)
+
+# "auto": usa el modelo si existe, si no el modo estatico.
+# "estatico": fuerza DER abierta = SIGUIENTE / IZQ abierta = ANTERIOR (ignora el modelo).
+# "dinamico": exige el modelo (si falta, avisa y cae al estatico).
+MODO_NAV = "auto"
+
+# Confianza de MediaPipe: bajarla ayuda a que "no pierda" la mano (sobre todo la izquierda)
+DETECT_CONF = 0.5
 
 COOLDOWN_NAV = 1.2        # segundos entre Siguiente / Anterior
 
+# --- Modelo dinamico ---
+UMBRAL_DINAMICO = 0.85    # probabilidad minima para aceptar un deslizamiento
+CONFIRMACIONES = 2        # predicciones consecutivas que deben coincidir
+PAUSAR_DINAMICO_EN_PUNTERO = True
+
 # --- Puntero ---
-ZONE_MARGIN_X = 0.10      # zona activa: margenes horizontales
-ZONE_MARGIN_TOP = 0.19    # margen superior (deja libre la barra de texto)
-ZONE_MARGIN_BOTTOM = 0.14 # margen inferior (deja libre la barra de cooldown)
-POINTER_MIN_ALPHA = 0.30  # suavizado con la mano casi quieta (anti-temblor)
-POINTER_MAX_ALPHA = 0.95  # suavizado con movimiento rapido (casi sin retardo)
-POINTER_FAST_PX = 150.0   # distancia (px de pantalla) considerada "movimiento rapido"
+ZONE_MARGIN_X = 0.15
+ZONE_MARGIN_Y = 0.18
+POINTER_MIN_ALPHA = 0.30
+POINTER_MAX_ALPHA = 0.95
+POINTER_FAST_PX = 150.0
 POINTER_DEADBAND_PX = 1.0
 
 # --- Umbrales geometricos de los dedos ---
-FINGER_EXT_RATIO = 1.15   # punta debe estar >15 % mas lejos de la muneca que el PIP
-THUMB_SPREAD = 0.55       # separacion minima pulgar-indice (en "palmas")
+# Un dedo se considera EXTENDIDO si su punta esta mas lejos de la muneca que su base
+# (nudillo) por este factor, medido en 3D. El pulgar se IGNORA a proposito: al
+# apuntar o abrir la mano casi nadie lo coloca igual, y era la causa de que el
+# puntero y la mano abierta fallaran.
+FINGER_EXT_RATIO = 1.30
 
 # --------------------------------------------------------------------------
-# Landmarks (MediaPipe Hands, 21 puntos)
+# Landmarks
 # --------------------------------------------------------------------------
 WRIST = 0
-THUMB_IP, THUMB_TIP = 3, 4
-INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
-MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
-RING_PIP, RING_TIP = 14, 16
-PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
+INDEX_MCP, INDEX_TIP = 5, 8
+MIDDLE_MCP, MIDDLE_TIP = 9, 12
+RING_MCP, RING_TIP = 13, 16
+PINKY_MCP, PINKY_TIP = 17, 20
 
+# nombre: (base/nudillo, punta)
 LONG_FINGERS = {
-    "index": (INDEX_TIP, INDEX_PIP),
-    "middle": (MIDDLE_TIP, MIDDLE_PIP),
-    "ring": (RING_TIP, RING_PIP),
-    "pinky": (PINKY_TIP, PINKY_PIP),
+    "index": (INDEX_MCP, INDEX_TIP),
+    "middle": (MIDDLE_MCP, MIDDLE_TIP),
+    "ring": (RING_MCP, RING_TIP),
+    "pinky": (PINKY_MCP, PINKY_TIP),
 }
 
 HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
+    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
 ]
 
-# --------------------------------------------------------------------------
-# Gestos del sistema
-# --------------------------------------------------------------------------
 G_REST, G_NEXT, G_PREV, G_POINTER, G_NONE = (
     "REPOSO", "SIGUIENTE", "ANTERIOR", "PUNTERO LASER", "SIN GESTO")
 
 GESTURE_COLORS = {  # BGR
-    G_REST: (180, 180, 180),
-    G_NEXT: (0, 220, 0),
-    G_PREV: (255, 160, 0),
-    G_POINTER: (0, 0, 255),
-    G_NONE: (120, 120, 120),
+    G_REST: (180, 180, 180), G_NEXT: (0, 220, 0), G_PREV: (255, 160, 0),
+    G_POINTER: (0, 0, 255), G_NONE: (120, 120, 120),
 }
+NAV_DINAMICA_COLOR = (200, 200, 0)
 
-# Fotogramas consecutivos que un gesto debe mantenerse para validarse.
 STABLE_FRAMES = {G_POINTER: 2, G_NEXT: 6, G_PREV: 6, G_REST: 3, G_NONE: 2}
 
 
 # --------------------------------------------------------------------------
-# Geometria
+# Detector de gestos dinamicos (modelo TorchScript)
 # --------------------------------------------------------------------------
-def dist(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+class DetectorDinamico:
+    """Mantiene una ventana deslizante de SEQ_LEN fotogramas y clasifica el movimiento."""
+
+    def __init__(self, modelo, torch_mod, meta):
+        self.modelo = modelo
+        self.torch = torch_mod
+        self.seq_len = int(meta["seq_len"])
+        self.escala = bool(meta["normalizar_escala"])
+        self.mano = meta.get("mano", "Right")
+        self.clases = {int(k): v for k, v in meta["clases"].items()}
+        self.id_sig = next(k for k, v in self.clases.items() if v == "siguiente")
+        self.id_ant = next(k for k, v in self.clases.items() if v == "anterior")
+        self.buf_rel = deque(maxlen=self.seq_len)
+        self.buf_mun = deque(maxlen=self.seq_len)
+
+    @property
+    def llenado(self):
+        return len(self.buf_rel)
+
+    def reset(self):
+        self.buf_rel.clear()
+        self.buf_mun.clear()
+
+    def actualizar(self, landmarks, w, h):
+        """Anade un fotograma; devuelve probabilidades por clase cuando la ventana esta llena."""
+        rel, mun = normalizar_mano(landmarks, w, h, self.escala)
+        self.buf_rel.append(rel)
+        self.buf_mun.append(mun)
+        if len(self.buf_rel) < self.seq_len:
+            return None
+        feats = construir_features(np.stack(self.buf_rel), np.stack(self.buf_mun))
+        with self.torch.no_grad():
+            logits = self.modelo(self.torch.from_numpy(feats[None]).float())
+            return self.torch.softmax(logits, dim=1)[0].numpy()
 
 
-def finger_states(p):
-    """Devuelve {dedo: extendido} para los 5 dedos de una mano (landmarks en px)."""
-    palm = max(dist(p[WRIST], p[MIDDLE_MCP]), 1e-6)
-    states = {}
-    for name, (tip, pip) in LONG_FINGERS.items():
-        states[name] = dist(p[tip], p[WRIST]) > dist(p[pip], p[WRIST]) * FINGER_EXT_RATIO
-    states["thumb"] = (
-        dist(p[THUMB_TIP], p[PINKY_MCP]) > dist(p[THUMB_IP], p[PINKY_MCP]) * 1.05
-        and dist(p[THUMB_TIP], p[INDEX_MCP]) > THUMB_SPREAD * palm
-    )
-    return states
+def cargar_detector_dinamico():
+    """Devuelve un DetectorDinamico o None (y explica por que) para usar el modo estatico."""
+    if not (MODELO_GESTOS.is_file() and MODELO_META.is_file()):
+        print("[AVISO] No se encontro el modelo entrenado en 'modelo/'. Usando navegacion ESTATICA.")
+        return None
+    try:
+        import torch
+    except ImportError:
+        print("[AVISO] PyTorch no esta instalado (python -m pip install torch). Usando navegacion ESTATICA.")
+        return None
+    try:
+        meta = json.loads(MODELO_META.read_text(encoding="utf-8"))
+        modelo = torch.jit.load(str(MODELO_GESTOS), map_location="cpu").eval()
+        torch.set_num_threads(1)
+        det = DetectorDinamico(modelo, torch, meta)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[AVISO] No se pudo cargar el modelo ({exc}). Usando navegacion ESTATICA.")
+        return None
+    print(f"[INFO] Modelo dinamico cargado ({meta.get('arquitectura', '?')}, "
+          f"val_acc={meta.get('val_accuracy', 0):.2f}, mano={det.mano}). Navegacion DINAMICA.")
+    return det
 
 
-def classify_hand(p):
-    """Clasifica UNA mano: FIST, OPEN (5 dedos), POINT (solo indice) u OTHER."""
-    st = finger_states(p)
-    count = sum(st.values())
-    if count == 0:
-        return "FIST"
-    if count == 5:
-        return "OPEN"
-    if st["index"] and count == 1:
-        return "POINT"
-    return "OTHER"
-
-
-def classify_frame(kinds, labels):
+# --------------------------------------------------------------------------
+# Gestos estaticos (puntero y respaldo)
+# --------------------------------------------------------------------------
+def finger_flags(p3):
     """
-    Combina todas las manos visibles en UN gesto global.
-    Devuelve (gesto, indice_de_la_mano_que_lo_origina).
+    p3: array (21, 3) en pixeles (x*w, y*h, z*w). Devuelve {dedo: extendido}.
+    Un dedo esta extendido si su punta esta mas lejos de la muneca que su nudillo
+    por FINGER_EXT_RATIO. Se mide en 3D para no fallar cuando la mano apunta
+    hacia la camara (en 2D el dedo se "acorta" y parecia doblado).
     """
+    muneca = p3[WRIST]
+    flags = {}
+    for nombre, (base, punta) in LONG_FINGERS.items():
+        d_base = max(float(np.linalg.norm(p3[base] - muneca)), 1e-6)
+        d_punta = float(np.linalg.norm(p3[punta] - muneca))
+        flags[nombre] = d_punta > d_base * FINGER_EXT_RATIO
+    return flags
+
+
+def classify_hand(p3):
+    """Devuelve (tipo, flags). Tipos: FIST, OPEN (4 dedos), POINT (solo indice), OTHER."""
+    flags = finger_flags(p3)
+    n = sum(flags.values())
+    if n == 0:
+        kind = "FIST"
+    elif n == 4:
+        kind = "OPEN"
+    elif n == 1 and flags["index"]:
+        kind = "POINT"
+    else:
+        kind = "OTHER"
+    return kind, flags
+
+
+def classify_frame(kinds, labels, nav_estatica):
+    """Devuelve (gesto, indice_de_mano). OPEN solo navega en modo estatico."""
     active = []
     for i, (kind, label) in enumerate(zip(kinds, labels)):
-        if kind == "OPEN":
+        if kind == "OPEN" and nav_estatica:
             active.append((G_NEXT if label == "Right" else G_PREV, i))
         elif kind == "POINT":
             active.append((G_POINTER, i))
-
     if len(active) == 1:
         return active[0]
     if len(active) > 1:
@@ -182,95 +261,6 @@ def classify_frame(kinds, labels):
     if all(k == "FIST" for k in kinds):
         return G_REST, None
     return G_NONE, None
-
-
-# --------------------------------------------------------------------------
-# Dibujo / HUD
-# --------------------------------------------------------------------------
-def put_text(img, text, org, scale=0.7, color=(255, 255, 255), thick=2):
-    x, y = org
-    cv2.putText(img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
-
-
-def draw_hand(img, pts, color, label):
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(img, (int(pts[a][0]), int(pts[a][1])), (int(pts[b][0]), int(pts[b][1])), color, 2, cv2.LINE_AA)
-    for x, y in pts:
-        cv2.circle(img, (int(x), int(y)), 4, (255, 255, 255), -1, cv2.LINE_AA)
-        cv2.circle(img, (int(x), int(y)), 4, color, 1, cv2.LINE_AA)
-    put_text(img, "IZQ" if label == "Left" else "DER",
-             (int(pts[WRIST][0]) - 20, int(pts[WRIST][1]) + 30), 0.6, color, 2)
-
-
-def draw_hud(img, gesture, zone, cd_left, last_action, fps, n_hands):
-    h, w = img.shape[:2]
-    zx1, zy1, zx2, zy2 = zone
-    color = GESTURE_COLORS.get(gesture, (255, 255, 255))
-
-    # 1. Panel superior completo
-    overlay = img.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 90), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
-
-    put_text(img, f"GESTO: {gesture}", (14, 38), 0.95, color, 2)
-    put_text(img, f"FPS {fps:3.0f} | Manos {n_hands}", (w - 230, 38), 0.55, (220, 220, 220), 1)
-    put_text(img, "IZQ abierta=ANTERIOR | DER abierta=SIGUIENTE | Indice=PUNTERO",
-             (14, 74), 0.52, (220, 220, 220), 1)
-
-    # 2. Zona activa del puntero
-    zone_color = (0, 0, 255) if gesture == G_POINTER else (90, 90, 90)
-    cv2.rectangle(img, (zx1, zy1), (zx2, zy2), zone_color, 2 if gesture == G_POINTER else 1)
-    put_text(img, "ZONA PUNTERO", (zx1 + 8, zy1 + 22), 0.5, zone_color, 1)
-
-    # 3. Indicador de cooldown inferior
-    bar_x, bar_y, bar_w, bar_h = 14, h - 44, 320, 18
-    cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
-    if cd_left > 0:
-        frac = min(cd_left / COOLDOWN_NAV, 1.0)
-        cv2.rectangle(img, (bar_x, bar_y), (bar_x + int(bar_w * frac), bar_y + bar_h), (0, 140, 255), -1)
-        put_text(img, f"COOLDOWN {cd_left:.1f}s", (bar_x + bar_w + 12, bar_y + 15), 0.6, (0, 140, 255), 2)
-    else:
-        cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (0, 180, 0), -1)
-        put_text(img, "LISTO", (bar_x + bar_w + 12, bar_y + 15), 0.6, (0, 220, 0), 2)
-    cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (200, 200, 200), 1)
-
-    if last_action:
-        put_text(img, f"Ultima accion: {last_action}", (14, h - 56), 0.55, (200, 200, 200), 1)
-    put_text(img, "Q / ESC / X = salir", (w - 210, h - 16), 0.5, (200, 200, 200), 1)
-
-
-# --------------------------------------------------------------------------
-# Modelo y camara
-# --------------------------------------------------------------------------
-def ensure_model():
-    if os.path.isfile(MODEL_PATH):
-        return MODEL_PATH
-    print(f"[INFO] No se encontro '{MODEL_PATH}'. Descargando modelo...")
-    try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print("[INFO] Modelo descargado correctamente.")
-        return MODEL_PATH
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] No se pudo descargar el modelo: {exc}")
-        print(f"        Descargalo manualmente desde:\n        {MODEL_URL}\n"
-              f"        y guardalo como: {MODEL_PATH}")
-        sys.exit(1)
-
-
-def open_camera():
-    """Abre la camara con ajustes orientados a baja latencia."""
-    backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
-    cap = cv2.VideoCapture(CAM_INDEX, backend)
-    if not cap.isOpened():
-        print("[ERROR] No se pudo abrir la camara web.")
-        sys.exit(1)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
 
 
 def hand_label(result, i):
@@ -284,32 +274,145 @@ def hand_label(result, i):
 
 
 # --------------------------------------------------------------------------
+# HUD
+# --------------------------------------------------------------------------
+def put_text(img, text, org, scale=0.7, color=(255, 255, 255), thick=2):
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def draw_hand(img, pts, color, label, info=""):
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(img, (int(pts[a][0]), int(pts[a][1])), (int(pts[b][0]), int(pts[b][1])), color, 2, cv2.LINE_AA)
+    for x, y in pts:
+        cv2.circle(img, (int(x), int(y)), 4, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(x), int(y)), 4, color, 1, cv2.LINE_AA)
+    put_text(img, "IZQ" if label == "Left" else "DER",
+             (int(pts[WRIST][0]) - 20, int(pts[WRIST][1]) + 30), 0.6, color, 2)
+    if info:   # diagnostico: tipo detectado y dedos extendidos (indice, medio, anular, menique)
+        put_text(img, info, (int(pts[WRIST][0]) - 40, int(pts[WRIST][1]) + 54), 0.5, (255, 255, 0), 1)
+
+
+def draw_dyn_panel(img, det, probs):
+    """Barras de probabilidad por clase + progreso de la ventana de fotogramas."""
+    h, w = img.shape[:2]
+    x0, y0, bw = w - 280, 110, 200
+    put_text(img, f"Ventana {det.llenado}/{det.seq_len}", (x0, y0 - 10), 0.5, (220, 220, 220), 1)
+    for i, (cid, nombre) in enumerate(sorted(det.clases.items())):
+        p = float(probs[cid]) if probs is not None else 0.0
+        y = y0 + 12 + i * 28
+        cv2.rectangle(img, (x0, y), (x0 + bw, y + 16), (60, 60, 60), -1)
+        color = (0, 220, 0) if (cid in (det.id_sig, det.id_ant) and p >= UMBRAL_DINAMICO) else (200, 200, 200)
+        cv2.rectangle(img, (x0, y), (x0 + int(bw * p), y + 16), color, -1)
+        cv2.line(img, (x0 + int(bw * UMBRAL_DINAMICO), y - 2), (x0 + int(bw * UMBRAL_DINAMICO), y + 18),
+                 (0, 140, 255), 1)
+        put_text(img, f"{nombre} {p:.2f}", (x0 + bw + 8, y + 14), 0.5, (220, 220, 220), 1)
+
+
+def draw_hud(img, gesture, etiqueta, zone, cd_left, last_action, fps, n_hands, modo_dinamico,
+             flash_text):
+    h, w = img.shape[:2]
+    zx1, zy1, zx2, zy2 = zone
+    color = GESTURE_COLORS.get(gesture, (255, 255, 255))
+    if modo_dinamico and etiqueta != gesture:
+        color = NAV_DINAMICA_COLOR
+
+    zone_color = (0, 0, 255) if gesture == G_POINTER else (90, 90, 90)
+    cv2.rectangle(img, (zx1, zy1), (zx2, zy2), zone_color, 2 if gesture == G_POINTER else 1)
+    put_text(img, "ZONA PUNTERO", (zx1 + 6, zy1 + 22), 0.5, zone_color, 1)
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 64), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+    put_text(img, f"GESTO: {etiqueta}", (14, 40), 1.0, color, 2)
+    put_text(img, f"FPS {fps:3.0f} | Manos {n_hands}", (w - 230, 28), 0.55, (220, 220, 220), 1)
+    put_text(img, "NAV: DINAMICO (modelo)" if modo_dinamico else "NAV: ESTATICO (sin modelo)",
+             (w - 230, 54), 0.5, (0, 220, 220) if modo_dinamico else (0, 140, 255), 1)
+
+    bar_x, bar_y, bar_w, bar_h = 14, h - 44, 320, 18
+    cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
+    if cd_left > 0:
+        frac = min(cd_left / COOLDOWN_NAV, 1.0)
+        cv2.rectangle(img, (bar_x, bar_y), (bar_x + int(bar_w * frac), bar_y + bar_h), (0, 140, 255), -1)
+        put_text(img, f"COOLDOWN {cd_left:.1f}s", (bar_x + bar_w + 12, bar_y + 15), 0.6, (0, 140, 255), 2)
+    else:
+        cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (0, 180, 0), -1)
+        put_text(img, "LISTO", (bar_x + bar_w + 12, bar_y + 15), 0.6, (0, 220, 0), 2)
+    cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (200, 200, 200), 1)
+
+    if last_action:
+        put_text(img, f"Ultima accion: {last_action}", (14, h - 56), 0.55, (200, 200, 200), 1)
+    leyenda = ("Desliza mano DER: <- SIGUIENTE | -> ANTERIOR | Indice = PUNTERO" if modo_dinamico
+               else "IZQ abierta=ANTERIOR | DER abierta=SIGUIENTE | Indice=PUNTERO")
+    put_text(img, leyenda, (14, 90), 0.5, (220, 220, 220), 1)
+    put_text(img, "Q / ESC / X = salir", (w - 210, h - 16), 0.5, (200, 200, 200), 1)
+
+    if flash_text:
+        (tw, _), _ = cv2.getTextSize(flash_text, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 5)
+        put_text(img, flash_text, ((w - tw) // 2, h // 2), 2.0, (0, 255, 0), 5)
+
+
+# --------------------------------------------------------------------------
+# Modelo de MediaPipe y camara
+# --------------------------------------------------------------------------
+def ensure_model():
+    if MODEL_PATH.is_file():
+        return str(MODEL_PATH)
+    print(f"[INFO] No se encontro '{MODEL_PATH}'. Descargando modelo...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        return str(MODEL_PATH)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] No se pudo descargar el modelo: {exc}\n        Descargalo desde {MODEL_URL}")
+        sys.exit(1)
+
+
+def open_camera():
+    backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+    cap = cv2.VideoCapture(CAM_INDEX, backend)
+    if not cap.isOpened():
+        print("[ERROR] No se pudo abrir la camara web.")
+        sys.exit(1)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+# --------------------------------------------------------------------------
 # Programa principal
 # --------------------------------------------------------------------------
 def main():
     model_path = ensure_model()
+    detector = None if MODO_NAV == "estatico" else cargar_detector_dinamico()
+    if MODO_NAV == "dinamico" and detector is None:
+        print("[AVISO] MODO_NAV='dinamico' pero no hay modelo utilizable: se usa el modo ESTATICO.")
+    modo_dinamico = detector is not None
+    print(f"[INFO] Navegacion: {'DINAMICA (modelo)' if modo_dinamico else 'ESTATICA (DER abierta = siguiente, IZQ abierta = anterior)'}")
 
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=model_path),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.6,
-        min_tracking_confidence=0.6,
+        min_hand_detection_confidence=DETECT_CONF,
+        min_hand_presence_confidence=DETECT_CONF,
+        min_tracking_confidence=DETECT_CONF,
     )
 
     cap = open_camera()
     screen_w, screen_h = pyautogui.size()
     cv2.namedWindow(WINDOW_NAME)
 
-    # --- Estado ---
     candidate, cand_count, stable = G_REST, 0, G_REST
     last_nav_time = -1e9
     last_action_label = ""
     pointer_pos = None
-    last_ts_ms = 0
-    prev_t = time.monotonic()
-    fps = 0.0
+    confirm_cls, confirm_n = None, 0
+    flash_text, flash_until = "", 0.0
+    probs = None
+    last_ts_ms, prev_t, fps = 0, time.monotonic(), 0.0
 
     try:
         with vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -319,24 +422,24 @@ def main():
                     print("[ERROR] No se pudo leer un fotograma de la camara.")
                     break
 
-                frame = cv2.flip(frame, 1)
+                frame = cv2.flip(frame, 1)       # espejo ANTES de detectar (igual que al grabar)
                 h, w = frame.shape[:2]
 
-                # --- Deteccion ---
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 ts_ms = max(int(time.monotonic() * 1000), last_ts_ms + 1)
                 last_ts_ms = ts_ms
                 result = landmarker.detect_for_video(mp_image, ts_ms)
 
-                hands = [[(lm.x * w, lm.y * h) for lm in hand] for hand in result.hand_landmarks]
+                hands3 = [np.array([[lm.x * w, lm.y * h, lm.z * w] for lm in hand], dtype=np.float32)
+                          for hand in result.hand_landmarks]
+                hands = [[(float(x), float(y)) for x, y, _ in p3] for p3 in hands3]
                 labels = [hand_label(result, i) for i in range(len(hands))]
-
                 now = time.monotonic()
 
-                # --- Clasificacion + antirrebote ---
-                kinds = [classify_hand(p) for p in hands]
-                raw, raw_idx = classify_frame(kinds, labels)
+                clasif = [classify_hand(p3) for p3 in hands3]
+                kinds = [k for k, _ in clasif]
+                raw, raw_idx = classify_frame(kinds, labels, nav_estatica=not modo_dinamico)
 
                 if raw == candidate:
                     cand_count += 1
@@ -344,14 +447,48 @@ def main():
                     candidate, cand_count = raw, 1
                 if cand_count >= STABLE_FRAMES[candidate]:
                     stable = candidate
-
                 act = stable if stable == raw else G_NONE
 
                 nav_left = max(0.0, last_nav_time + COOLDOWN_NAV - now)
-                zone = (int(w * ZONE_MARGIN_X), int(h * ZONE_MARGIN_TOP),
-                        int(w * (1 - ZONE_MARGIN_X)), int(h * (1 - ZONE_MARGIN_BOTTOM)))
+                zone = (int(w * ZONE_MARGIN_X), int(h * ZONE_MARGIN_Y),
+                        int(w * (1 - ZONE_MARGIN_X)), int(h * (1 - ZONE_MARGIN_Y)))
 
-                # --- Acciones ---
+                # ---------------- Navegacion DINAMICA (modelo) ----------------
+                hay_mano_dyn = False
+                if modo_dinamico:
+                    idx_dyn = None
+                    for i, lab in enumerate(labels):
+                        if detector.mano == "Any" or lab == detector.mano:
+                            idx_dyn = i
+                            break
+                    apuntando = any(k == "POINT" for k in kinds)
+                    if idx_dyn is None or (PAUSAR_DINAMICO_EN_PUNTERO and apuntando):
+                        detector.reset()
+                        probs, confirm_cls, confirm_n = None, None, 0
+                    else:
+                        hay_mano_dyn = True
+                        probs = detector.actualizar(result.hand_landmarks[idx_dyn], w, h)
+                        if probs is not None:
+                            c = int(np.argmax(probs))
+                            p = float(probs[c])
+                            if c in (detector.id_sig, detector.id_ant) and p >= UMBRAL_DINAMICO:
+                                confirm_n = confirm_n + 1 if c == confirm_cls else 1
+                                confirm_cls = c
+                            else:
+                                confirm_cls, confirm_n = None, 0
+
+                            if confirm_n >= CONFIRMACIONES and nav_left == 0:
+                                if c == detector.id_sig:
+                                    pyautogui.press("right")
+                                    last_action_label, flash_text = "SIGUIENTE (swipe)", "SIGUIENTE >>"
+                                else:
+                                    pyautogui.press("left")
+                                    last_action_label, flash_text = "ANTERIOR (swipe)", "<< ANTERIOR"
+                                last_nav_time, flash_until = now, now + 0.8
+                                detector.reset()          # evita re-disparos con el mismo movimiento
+                                probs, confirm_cls, confirm_n = None, None, 0
+
+                # ---------------- Puntero y navegacion ESTATICA ----------------
                 if act != G_POINTER:
                     pointer_pos = None
 
@@ -380,17 +517,24 @@ def main():
 
                 cd_left = max(0.0, last_nav_time + COOLDOWN_NAV - time.monotonic())
 
-                # --- HUD ---
+                # ---------------- HUD ----------------
+                etiqueta = stable
+                if modo_dinamico and hay_mano_dyn and stable in (G_REST, G_NONE):
+                    etiqueta = "NAVEGACION (modelo)"
                 gcolor = GESTURE_COLORS.get(stable, (255, 255, 255))
-                for p, lab in zip(hands, labels):
-                    draw_hand(frame, p, gcolor, lab)
+                for p_, lab, (kind_, fl_) in zip(hands, labels, clasif):
+                    dedos = "".join("1" if fl_[n] else "0" for n in ("index", "middle", "ring", "pinky"))
+                    draw_hand(frame, p_, gcolor, lab, f"{kind_} {dedos}")
                 if stable == G_POINTER and raw_idx is not None:
                     tip = hands[raw_idx][INDEX_TIP]
                     cv2.circle(frame, (int(tip[0]), int(tip[1])), 12, (0, 0, 255), 2, cv2.LINE_AA)
 
                 fps = 0.9 * fps + 0.1 * (1.0 / max(time.monotonic() - prev_t, 1e-6))
                 prev_t = time.monotonic()
-                draw_hud(frame, stable, zone, cd_left, last_action_label, fps, len(hands))
+                draw_hud(frame, stable, etiqueta, zone, cd_left, last_action_label, fps, len(hands),
+                         modo_dinamico, flash_text if now < flash_until else "")
+                if modo_dinamico:
+                    draw_dyn_panel(frame, detector, probs)
 
                 cv2.imshow(WINDOW_NAME, frame)
 

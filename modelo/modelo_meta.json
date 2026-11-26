@@ -1,0 +1,20 @@
+{
+  "seq_len": 20,
+  "n_features_entrada": 67,
+  "features": "rel_muneca(63) + desplazamiento_muneca(2) + velocidad_muneca(2)",
+  "clases": {
+    "0": "neutro",
+    "1": "siguiente",
+    "2": "anterior"
+  },
+  "normalizar_escala": true,
+  "espejo": true,
+  "mano": "Any",
+  "arquitectura": "cnn",
+  "val_accuracy": 0.9714285714285714,
+  "muestras_por_clase": {
+    "neutro": 60,
+    "siguiente": 56,
+    "anterior": 60
+  }
+}

@@ -1,0 +1,134 @@
+import math
+import cv2
+import mediapipe as mp
+# [MEDIAPIPE] Módulos de la API moderna "Tasks" para cargar modelos de visión artificial
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# ==============================================================================
+# 1. CONFIGURACIÓN DE MEDIAPIPE (MOTOR DE INTELIGENCIA ARTIFICIAL)
+# ==============================================================================
+
+# [MEDIAPIPE] Apunta al archivo binario (.task) que contiene la red neuronal ya entrenada
+base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
+
+# [MEDIAPIPE] Define las reglas de comportamiento del detector:
+# - num_hands=2: detecta hasta 2 manos al mismo tiempo.
+# - min_hand_detection_confidence=0.6: exige 60% de seguridad para detectar una mano nueva.
+# - min_tracking_confidence=0.6: exige 60% de seguridad para seguirle el rastro entre fotogramas.
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    num_hands=2,
+    min_hand_detection_confidence=0.6,
+    min_tracking_confidence=0.6
+)
+
+# [MEDIAPIPE] Carga el modelo en memoria y crea el objeto detector listo para usar
+detector = vision.HandLandmarker.create_from_options(options)
+
+# ==============================================================================
+# 2. MAPA DEL ESQUELETO Y HERRAMIENTAS DE CÁLCULO
+# ==============================================================================
+
+# Lista de parejas de IDs (del 0 al 20) que definen qué articulaciones se unen con líneas
+CONEXIONES_MANO = [
+    (0, 1), (1, 2), (2, 3), (3, 4),        # Pulgar (0 es muñeca, 4 es punta)
+    (0, 5), (5, 6), (6, 7), (7, 8),        # Índice (8 es punta)
+    (5, 9), (9, 10), (10, 11), (11, 12),   # Medio (12 es punta)
+    (9, 13), (13, 14), (14, 15), (15, 16), # Anular (16 es punta)
+    (13, 17), (17, 18), (18, 19), (19, 20),# Meñique (20 es punta)
+    (0, 17)                                # Línea de la base de la palma
+]
+
+# Función auxiliar en Python puro: aplica Pitágoras para medir distancia en píxeles entre dos puntos
+def distancia(p1, p2):
+    return math.hypot(p2[1] - p1[1], p2[2] - p1[2])
+
+# [OPENCV] Enciende la webcam principal (índice 0)
+cap = cv2.VideoCapture(0)
+
+# IDs asignados por MediaPipe a las puntas de los 4 dedos largos
+puntas_dedos = [8, 12, 16, 20]
+
+# ==============================================================================
+# 3. BUCLE PRINCIPAL DE VIDEO E INFERENCIA EN TIEMPO REAL
+# ==============================================================================
+
+while True:
+    # [OPENCV] Captura un fotograma (imagen) de la cámara
+    exito, img = cap.read()
+    if not exito:
+        break
+
+    # [OPENCV] Voltea la imagen horizontalmente (1) para que actúe como un espejo natural
+    img = cv2.flip(img, 1)
+
+    # [OPENCV -> MEDIAPIPE] OpenCV captura en BGR (Azul-Verde-Rojo), pero MediaPipe exige RGB (Rojo-Verde-Azul)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # [MEDIAPIPE] Empaqueta la imagen de OpenCV en el formato nativo que entiende MediaPipe
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+    
+    # [MEDIAPIPE] Ejecuta la red neuronal sobre el fotograma y devuelve las coordenadas de las manos
+    resultados = detector.detect(mp_image)
+    
+    total_dedos = 0
+
+    # [MEDIAPIPE] Verifica si la IA encontró al menos una mano en este fotograma
+    if resultados.hand_landmarks:
+        # Recorre cada mano detectada (1 o 2 iteraciones dependiendo de cuántas manos vea)
+        for hand_landmarks in resultados.hand_landmarks:
+            puntos = []
+            alto, ancho, _ = img.shape # Obtiene el tamaño en píxeles de la ventana de video
+            
+            # [MEDIAPIPE -> OPENCV] Convierte los 21 puntos normalizados (0.0 a 1.0) a píxeles reales
+            for id, lm in enumerate(hand_landmarks):
+                cx, cy = int(lm.x * ancho), int(lm.y * alto)
+                puntos.append((id, cx, cy)) # Guarda (número_de_punto, coordenada_X, coordenada_Y)
+                
+                # [OPENCV] Dibuja un círculo morado en cada una de las 21 articulaciones
+                cv2.circle(img, (cx, cy), 5, (255, 0, 255), cv2.FILLED)
+
+            # [OPENCV] Dibuja las líneas verdes que unen los puntos según el mapa CONEXIONES_MANO
+            for inicio, fin in CONEXIONES_MANO:
+                cv2.line(img, (puntos[inicio][1], puntos[inicio][2]), 
+                         (puntos[fin][1], puntos[fin][2]), (0, 255, 0), 2)
+
+            # ==================================================================
+            # 4. LÓGICA GEOMÉTRICA PARA CONTAR DEDOS LEVANTADOS
+            # ==================================================================
+            if puntos:
+                # PULGAR: Compara qué tan lejos está la punta (4) vs la articulación media (3)
+                # respecto a la base del meñique (17). Si la punta está más lejos, está estirado.
+                if distancia(puntos[4], puntos[17]) > distancia(puntos[3], puntos[17]):
+                    total_dedos += 1
+
+                # RESTO DE DEDOS: En pantalla el eje Y vale 0 arriba y crece hacia abajo.
+                # Si la punta (punta) tiene una Y menor que la articulación anterior (punta - 1),
+                # significa que el dedo está apuntando hacia arriba (levantado).
+                for punta in puntas_dedos:
+                    if puntos[punta][2] < puntos[punta - 1][2]:
+                        total_dedos += 1
+
+    # ==========================================================================
+    # 5. INTERFAZ VISUAL Y CONTROL DE SALIDA
+    # ==========================================================================
+
+    # [OPENCV] Escribe el texto con el conteo total en la esquina superior izquierda (X=30, Y=70)
+    cv2.putText(img, f"Total dedos: {total_dedos}", (30, 70), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 0), 3)
+
+    # [OPENCV] Muestra el fotograma final ya procesado en una ventana de Windows
+    cv2.imshow("Contador de Dedos", img)
+
+    # [OPENCV] Espera 1 milisegundo por una pulsación de teclado
+    tecla = cv2.waitKey(1) & 0xFF
+    
+    # Sale del bucle si presionas 'q', 'Q', 'ESC' (27) o si cierras la ventana con la 'X'
+    if (tecla == ord('q') or tecla == ord('Q') or tecla == 27 or 
+        cv2.getWindowProperty("Contador de Dedos", cv2.WND_PROP_VISIBLE) < 1):
+        break
+
+# [OPENCV] Apaga la cámara y libera los recursos de la ventana al terminar
+cap.release()
+cv2.destroyAllWindows()

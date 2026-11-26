@@ -3,7 +3,7 @@
 """
 ==========================================================================
  CONTROL DE PRESENTACIONES POR GESTOS (PowerPoint / Google Slides / Canva)
- Version 5 - gestos dinamicos + deteccion de dedos mas robusta
+ Version 7 - navegacion con filtro de movimiento real, puntero y dibujo
 ==========================================================================
 
 INSTALACION (con el venv activo):
@@ -26,7 +26,14 @@ MODOS DE NAVEGACION (se elige solo al arrancar):
 
 EN AMBOS MODOS:
     Solo indice levantado -> PUNTERO (mueve el cursor, sin cooldown)
+    Indice y medio unidos -> DIBUJAR (clic izquierdo sostenido)
+    Separar indice y medio -> deja de dibujar
     Puno cerrado / sin mano -> REPOSO
+
+IMPORTANTE:
+    Antes de dibujar, selecciona manualmente la herramienta Lapiz/Dibujar
+    en PowerPoint o Canva. El programa mueve el cursor y mantiene pulsado
+    el clic izquierdo mientras detecta el gesto.
 
     En modo dinamico el reconocimiento de deslizamientos se pausa mientras
     apuntas con el indice, para que mover el puntero no dispare diapositivas.
@@ -93,12 +100,16 @@ MODO_NAV = "auto"
 # Confianza de MediaPipe: bajarla ayuda a que "no pierda" la mano (sobre todo la izquierda)
 DETECT_CONF = 0.5
 
-COOLDOWN_NAV = 1.2        # segundos entre Siguiente / Anterior
+COOLDOWN_NAV = 1.8        # segundos entre Siguiente / Anterior
 
 # --- Modelo dinamico ---
-UMBRAL_DINAMICO = 0.85    # probabilidad minima para aceptar un deslizamiento
-CONFIRMACIONES = 2        # predicciones consecutivas que deben coincidir
+UMBRAL_DINAMICO = 0.93    # confianza minima para aceptar un deslizamiento
+CONFIRMACIONES = 3        # predicciones consecutivas que deben coincidir
+UMBRAL_MOVIMIENTO_X = 0.12  # la muneca debe desplazarse al menos 12% del ancho de camara
 PAUSAR_DINAMICO_EN_PUNTERO = True
+
+# --- Dibujo con indice y medio unidos ---
+DRAW_TIP_DISTANCE_RATIO = 0.38  # menor = exige que las puntas esten mas juntas
 
 # --- Puntero ---
 ZONE_MARGIN_X = 0.15
@@ -138,16 +149,18 @@ HAND_CONNECTIONS = [
     (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
 ]
 
-G_REST, G_NEXT, G_PREV, G_POINTER, G_NONE = (
-    "REPOSO", "SIGUIENTE", "ANTERIOR", "PUNTERO LASER", "SIN GESTO")
+G_REST, G_NEXT, G_PREV, G_POINTER, G_DRAW, G_NONE = (
+    "REPOSO", "SIGUIENTE", "ANTERIOR", "PUNTERO", "DIBUJAR", "SIN GESTO")
 
 GESTURE_COLORS = {  # BGR
     G_REST: (180, 180, 180), G_NEXT: (0, 220, 0), G_PREV: (255, 160, 0),
-    G_POINTER: (0, 0, 255), G_NONE: (120, 120, 120),
+    G_POINTER: (0, 0, 255), G_DRAW: (255, 0, 255), G_NONE: (120, 120, 120),
 }
 NAV_DINAMICA_COLOR = (200, 200, 0)
 
-STABLE_FRAMES = {G_POINTER: 2, G_NEXT: 6, G_PREV: 6, G_REST: 3, G_NONE: 2}
+STABLE_FRAMES = {
+    G_POINTER: 2, G_DRAW: 3, G_NEXT: 6, G_PREV: 6, G_REST: 3, G_NONE: 2
+}
 
 
 # --------------------------------------------------------------------------
@@ -167,6 +180,7 @@ class DetectorDinamico:
         self.id_ant = next(k for k, v in self.clases.items() if v == "anterior")
         self.buf_rel = deque(maxlen=self.seq_len)
         self.buf_mun = deque(maxlen=self.seq_len)
+        self.buf_x = deque(maxlen=self.seq_len)
 
     @property
     def llenado(self):
@@ -175,12 +189,22 @@ class DetectorDinamico:
     def reset(self):
         self.buf_rel.clear()
         self.buf_mun.clear()
+        self.buf_x.clear()
+
+    def movimiento_suficiente(self):
+        """Exige desplazamiento horizontal real de la muneca dentro de la secuencia."""
+        if len(self.buf_x) < self.seq_len:
+            return False
+        desplazamiento = abs(float(self.buf_x[-1]) - float(self.buf_x[0]))
+        return desplazamiento >= UMBRAL_MOVIMIENTO_X
 
     def actualizar(self, landmarks, w, h):
         """Anade un fotograma; devuelve probabilidades por clase cuando la ventana esta llena."""
         rel, mun = normalizar_mano(landmarks, w, h, self.escala)
         self.buf_rel.append(rel)
         self.buf_mun.append(mun)
+        # x normalizada de la muneca (0 a 1); se usa como filtro anti-falsos positivos.
+        self.buf_x.append(float(landmarks[WRIST].x))
         if len(self.buf_rel) < self.seq_len:
             return None
         feats = construir_features(np.stack(self.buf_rel), np.stack(self.buf_mun))
@@ -190,14 +214,14 @@ class DetectorDinamico:
 
 
 def cargar_detector_dinamico():
-    """Devuelve un DetectorDinamico o None (y explica por que) para usar el modo estatico."""
+    """Devuelve el detector dinamico o None; sin modelo no se navega por gestos estaticos."""
     if not (MODELO_GESTOS.is_file() and MODELO_META.is_file()):
-        print("[AVISO] No se encontro el modelo entrenado en 'modelo/'. Usando navegacion ESTATICA.")
+        print("[AVISO] No se encontro el modelo entrenado en 'modelo/'. La navegacion queda DESACTIVADA hasta cargar el modelo dinamico.")
         return None
     try:
         import torch
     except ImportError:
-        print("[AVISO] PyTorch no esta instalado (python -m pip install torch). Usando navegacion ESTATICA.")
+        print("[AVISO] PyTorch no esta instalado (python -m pip install torch). La navegacion queda DESACTIVADA hasta cargar el modelo dinamico.")
         return None
     try:
         meta = json.loads(MODELO_META.read_text(encoding="utf-8"))
@@ -205,7 +229,7 @@ def cargar_detector_dinamico():
         torch.set_num_threads(1)
         det = DetectorDinamico(modelo, torch, meta)
     except Exception as exc:  # noqa: BLE001
-        print(f"[AVISO] No se pudo cargar el modelo ({exc}). Usando navegacion ESTATICA.")
+        print(f"[AVISO] No se pudo cargar el modelo ({exc}). La navegacion queda DESACTIVADA hasta cargar el modelo dinamico.")
         return None
     print(f"[INFO] Modelo dinamico cargado ({meta.get('arquitectura', '?')}, "
           f"val_acc={meta.get('val_accuracy', 0):.2f}, mano={det.mano}). Navegacion DINAMICA.")
@@ -231,11 +255,37 @@ def finger_flags(p3):
     return flags
 
 
+def dedos_juntos(p3):
+    """
+    Comprueba si las puntas del indice y medio estan juntas.
+    La distancia se compara con el ancho de la palma para adaptarse
+    a manos que aparecen mas cerca o mas lejos de la camara.
+    """
+    distancia_puntas = float(np.linalg.norm(p3[INDEX_TIP] - p3[MIDDLE_TIP]))
+    ancho_palma = float(np.linalg.norm(p3[INDEX_MCP] - p3[PINKY_MCP]))
+    return distancia_puntas < max(ancho_palma * DRAW_TIP_DISTANCE_RATIO, 1.0)
+
+
 def classify_hand(p3):
-    """Devuelve (tipo, flags). Tipos: FIST, OPEN (4 dedos), POINT (solo indice), OTHER."""
+    """
+    Devuelve (tipo, flags).
+    Tipos: FIST, OPEN, POINT, DRAW, OTHER.
+    DRAW requiere indice y medio extendidos y juntos; anular y menique doblados.
+    """
     flags = finger_flags(p3)
     n = sum(flags.values())
-    if n == 0:
+
+    gesto_dibujo = (
+        flags["index"]
+        and flags["middle"]
+        and not flags["ring"]
+        and not flags["pinky"]
+        and dedos_juntos(p3)
+    )
+
+    if gesto_dibujo:
+        kind = "DRAW"
+    elif n == 0:
         kind = "FIST"
     elif n == 4:
         kind = "OPEN"
@@ -247,13 +297,17 @@ def classify_hand(p3):
 
 
 def classify_frame(kinds, labels, nav_estatica):
-    """Devuelve (gesto, indice_de_mano). OPEN solo navega en modo estatico."""
+    """Devuelve (gesto, indice_de_mano). OPEN navega solo en modo estatico."""
     active = []
     for i, (kind, label) in enumerate(zip(kinds, labels)):
-        if kind == "OPEN" and nav_estatica:
+        # DIBUJAR tiene prioridad sobre el puntero y la navegacion.
+        if kind == "DRAW":
+            active.append((G_DRAW, i))
+        elif kind == "OPEN" and nav_estatica:
             active.append((G_NEXT if label == "Right" else G_PREV, i))
         elif kind == "POINT":
             active.append((G_POINTER, i))
+
     if len(active) == 1:
         return active[0]
     if len(active) > 1:
@@ -326,8 +380,8 @@ def draw_hud(img, gesture, etiqueta, zone, cd_left, last_action, fps, n_hands, m
     cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
     put_text(img, f"GESTO: {etiqueta}", (14, 40), 1.0, color, 2)
     put_text(img, f"FPS {fps:3.0f} | Manos {n_hands}", (w - 230, 28), 0.55, (220, 220, 220), 1)
-    put_text(img, "NAV: DINAMICO (modelo)" if modo_dinamico else "NAV: ESTATICO (sin modelo)",
-             (w - 230, 54), 0.5, (0, 220, 220) if modo_dinamico else (0, 140, 255), 1)
+    put_text(img, "NAV: DINAMICO (modelo)" if modo_dinamico else "NAV: BLOQUEADA (falta modelo)",
+             (w - 300, 54), 0.48, (0, 220, 220) if modo_dinamico else (0, 140, 255), 1)
 
     bar_x, bar_y, bar_w, bar_h = 14, h - 44, 320, 18
     cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
@@ -342,9 +396,11 @@ def draw_hud(img, gesture, etiqueta, zone, cd_left, last_action, fps, n_hands, m
 
     if last_action:
         put_text(img, f"Ultima accion: {last_action}", (14, h - 56), 0.55, (200, 200, 200), 1)
-    leyenda = ("Desliza mano DER: <- SIGUIENTE | -> ANTERIOR | Indice = PUNTERO" if modo_dinamico
-               else "IZQ abierta=ANTERIOR | DER abierta=SIGUIENTE | Indice=PUNTERO")
+    leyenda = ("Desliza DER: <- SIGUIENTE | -> ANTERIOR" if modo_dinamico
+               else "Navegacion desactivada: falta modelo dinamico")
     put_text(img, leyenda, (14, 90), 0.5, (220, 220, 220), 1)
+    put_text(img, "Indice= PUNTERO | Indice+medio juntos= DIBUJAR",
+             (14, 112), 0.48, (220, 220, 220), 1)
     put_text(img, "Q / ESC / X = salir", (w - 210, h - 16), 0.5, (200, 200, 200), 1)
 
     if flash_text:
@@ -390,7 +446,7 @@ def main():
     if MODO_NAV == "dinamico" and detector is None:
         print("[AVISO] MODO_NAV='dinamico' pero no hay modelo utilizable: se usa el modo ESTATICO.")
     modo_dinamico = detector is not None
-    print(f"[INFO] Navegacion: {'DINAMICA (modelo)' if modo_dinamico else 'ESTATICA (DER abierta = siguiente, IZQ abierta = anterior)'}")
+    print(f"[INFO] Navegacion: {'DINAMICA (modelo + filtro de movimiento)' if modo_dinamico else 'DESACTIVADA (puntero y dibujo siguen disponibles)'}")
 
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=model_path),
@@ -409,6 +465,7 @@ def main():
     last_nav_time = -1e9
     last_action_label = ""
     pointer_pos = None
+    drawing = False
     confirm_cls, confirm_n = None, 0
     flash_text, flash_until = "", 0.0
     probs = None
@@ -439,7 +496,7 @@ def main():
 
                 clasif = [classify_hand(p3) for p3 in hands3]
                 kinds = [k for k, _ in clasif]
-                raw, raw_idx = classify_frame(kinds, labels, nav_estatica=not modo_dinamico)
+                raw, raw_idx = classify_frame(kinds, labels, nav_estatica=False)
 
                 if raw == candidate:
                     cand_count += 1
@@ -461,7 +518,7 @@ def main():
                         if detector.mano == "Any" or lab == detector.mano:
                             idx_dyn = i
                             break
-                    apuntando = any(k == "POINT" for k in kinds)
+                    apuntando = any(k in ("POINT", "DRAW") for k in kinds)
                     if idx_dyn is None or (PAUSAR_DINAMICO_EN_PUNTERO and apuntando):
                         detector.reset()
                         probs, confirm_cls, confirm_n = None, None, 0
@@ -471,10 +528,13 @@ def main():
                         if probs is not None:
                             c = int(np.argmax(probs))
                             p = float(probs[c])
-                            if c in (detector.id_sig, detector.id_ant) and p >= UMBRAL_DINAMICO:
+                            movimiento_ok = detector.movimiento_suficiente()
+                            if (c in (detector.id_sig, detector.id_ant)
+                                    and p >= UMBRAL_DINAMICO and movimiento_ok):
                                 confirm_n = confirm_n + 1 if c == confirm_cls else 1
                                 confirm_cls = c
                             else:
+                                # Sin desplazamiento horizontal real, no se acepta la prediccion.
                                 confirm_cls, confirm_n = None, 0
 
                             if confirm_n >= CONFIRMACIONES and nav_left == 0:
@@ -485,29 +545,49 @@ def main():
                                     pyautogui.press("left")
                                     last_action_label, flash_text = "ANTERIOR (swipe)", "<< ANTERIOR"
                                 last_nav_time, flash_until = now, now + 0.8
-                                detector.reset()          # evita re-disparos con el mismo movimiento
+                                detector.reset()          # exige una secuencia nueva para otro deslizamiento
                                 probs, confirm_cls, confirm_n = None, None, 0
 
-                # ---------------- Puntero y navegacion ESTATICA ----------------
-                if act != G_POINTER:
+                # ---------------- Puntero, dibujo y navegacion ESTATICA ----------------
+                if act not in (G_POINTER, G_DRAW):
                     pointer_pos = None
 
-                if act == G_POINTER and raw_idx is not None:
+                # El mismo mapeo de camara a pantalla se usa para puntero y dibujo.
+                if act in (G_POINTER, G_DRAW) and raw_idx is not None:
                     tip = hands[raw_idx][INDEX_TIP]
                     tx = float(np.interp(tip[0], (zone[0], zone[2]), (0, screen_w - 1)))
                     ty = float(np.interp(tip[1], (zone[1], zone[3]), (0, screen_h - 1)))
-                    if pointer_pos is None:
-                        cx, cy = pyautogui.position()
-                        pointer_pos = [float(cx), float(cy)]
-                    d = math.hypot(tx - pointer_pos[0], ty - pointer_pos[1])
-                    if d > POINTER_DEADBAND_PX:
-                        speed = min(d / POINTER_FAST_PX, 1.0)
-                        alpha = POINTER_MIN_ALPHA + (POINTER_MAX_ALPHA - POINTER_MIN_ALPHA) * speed
-                        pointer_pos[0] += (tx - pointer_pos[0]) * alpha
-                        pointer_pos[1] += (ty - pointer_pos[1]) * alpha
-                        pyautogui.moveTo(int(pointer_pos[0]), int(pointer_pos[1]), _pause=False)
 
-                elif act == G_NEXT and nav_left == 0:
+                    if act == G_POINTER:
+                        if drawing:
+                            pyautogui.mouseUp(button="left")
+                            drawing = False
+                        if pointer_pos is None:
+                            cx, cy = pyautogui.position()
+                            pointer_pos = [float(cx), float(cy)]
+                        d = math.hypot(tx - pointer_pos[0], ty - pointer_pos[1])
+                        if d > POINTER_DEADBAND_PX:
+                            speed = min(d / POINTER_FAST_PX, 1.0)
+                            alpha = POINTER_MIN_ALPHA + (POINTER_MAX_ALPHA - POINTER_MIN_ALPHA) * speed
+                            pointer_pos[0] += (tx - pointer_pos[0]) * alpha
+                            pointer_pos[1] += (ty - pointer_pos[1]) * alpha
+                            pyautogui.moveTo(int(pointer_pos[0]), int(pointer_pos[1]), _pause=False)
+
+                    elif act == G_DRAW:
+                        # Al entrar al gesto, posiciona el cursor y mantiene pulsado
+                        # el boton izquierdo para trazar sobre la diapositiva.
+                        pyautogui.moveTo(int(tx), int(ty), _pause=False)
+                        if not drawing:
+                            pyautogui.mouseDown(button="left")
+                            drawing = True
+                        last_action_label = "DIBUJANDO"
+
+                # Al dejar de hacer el gesto, se suelta el clic para terminar el trazo.
+                if act != G_DRAW and drawing:
+                    pyautogui.mouseUp(button="left")
+                    drawing = False
+
+                if act == G_NEXT and nav_left == 0:
                     pyautogui.press("right")
                     last_nav_time, last_action_label = now, "SIGUIENTE (right)"
 
@@ -525,9 +605,10 @@ def main():
                 for p_, lab, (kind_, fl_) in zip(hands, labels, clasif):
                     dedos = "".join("1" if fl_[n] else "0" for n in ("index", "middle", "ring", "pinky"))
                     draw_hand(frame, p_, gcolor, lab, f"{kind_} {dedos}")
-                if stable == G_POINTER and raw_idx is not None:
+                if stable in (G_POINTER, G_DRAW) and raw_idx is not None:
                     tip = hands[raw_idx][INDEX_TIP]
-                    cv2.circle(frame, (int(tip[0]), int(tip[1])), 12, (0, 0, 255), 2, cv2.LINE_AA)
+                    color_tip = (255, 0, 255) if stable == G_DRAW else (0, 0, 255)
+                    cv2.circle(frame, (int(tip[0]), int(tip[1])), 12, color_tip, 2, cv2.LINE_AA)
 
                 fps = 0.9 * fps + 0.1 * (1.0 / max(time.monotonic() - prev_t, 1e-6))
                 prev_t = time.monotonic()
@@ -544,6 +625,9 @@ def main():
                 if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     break
     finally:
+        if drawing:
+            pyautogui.mouseUp(button="left")
+            drawing = False
         cap.release()
         cv2.destroyAllWindows()
         print("[INFO] Programa finalizado.")
